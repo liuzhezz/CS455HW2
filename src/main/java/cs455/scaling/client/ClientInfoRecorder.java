@@ -29,7 +29,7 @@ public class ClientInfoRecorder extends Thread{
                 System.err.println(ie.getMessage());
             }
 
-            System.out.println(LocalTime.now() + " Total sent Count: " + pkgSent + ", Total Received Count: " + pkgReceive);
+            System.out.println("[" + LocalTime.now() + "]" + " Total Sent Count: " + pkgSent + ", Total Received Count: " + pkgReceive);
         }
     }
 }

@@ -1,20 +1,20 @@
 package cs455.scaling.server;
 
-import cs455.scaling.pool.HashFunction;
-import cs455.scaling.pool.ThreadPool;
 
-import java.io.Closeable;
+import cs455.scaling.pool.ReadTask;
+import cs455.scaling.pool.Task;
+import cs455.scaling.pool.ThreadPool;
+import cs455.scaling.pool.WriteTask;
+
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
+import java.nio.channels.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Iterator;
+import java.util.UUID;
 
 
 public class Server{
@@ -23,111 +23,151 @@ public class Server{
     private int threadPoolSize;
     private int batchSize;
     private int batchTime;
-    private Selector serverSelector;
-    private ServerInfoRecorder serverInfoRecorder;
+
     private ThreadPool threadPool;
-    private HashFunction instance = new HashFunction();
+    private ServerInfoRecorder serverInfoRecorder;
+    private Selector selector;
+    private ServerSocketChannel serverSocketChannel;
 
 
 
 
-    public Server(int portNumber, int threadPoolSize,  int batchSize, int batchTime){
+    public Server(int portNumber, int threadPoolSize, int batchSize, int batchTime){
         this.portNumber = portNumber;
         this.threadPoolSize = threadPoolSize;
         this.batchSize = batchSize;
         this.batchTime = batchTime;
-        this.serverInfoRecorder = new ServerInfoRecorder();
-        this.threadPool = new ThreadPool(threadPoolSize);
     }
 
-    public void start(){
+    public void initiate() throws IOException, NoSuchAlgorithmException{
+        //initiate threadPool and start the thread
+        threadPool = new ThreadPool(this.threadPoolSize,this.batchSize,this.batchTime);
+        threadPool.initiate();
+        threadPool.start();
+
+        //initiate serverInfoRecorder and start the thread
+        this.serverInfoRecorder = new ServerInfoRecorder();
         serverInfoRecorder.start();
-        try(ServerSocketChannel serverSocketChannel = ServerSocketChannel.open().bind(new InetSocketAddress(portNumber));
-            Selector selector = Selector.open()){
-            serverSelector = selector;
-            serverSocketChannel.configureBlocking(false);
-            serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
 
-            while (true){
-                selector.select();
-                for (Iterator it = selector.selectedKeys().iterator(); it.hasNext(); it.remove()) {
-                    SelectionKey selectionKey = (SelectionKey) it.next();
+        this.selector = Selector.open();
 
-                    if (selectionKey.isAcceptable()) {  //the server selector key
-                        SocketChannel socketChannel = ((ServerSocketChannel)selectionKey.channel()).accept();
-                        if (socketChannel == null) continue;  //skip if no socket request connection
-                        socketChannel.configureBlocking(false);
-                        ByteBuffer byteBuffer = ByteBuffer.allocate(8192);
-                        SelectionKey socketChannelRead = socketChannel.register(selector, SelectionKey.OP_READ,byteBuffer);
-                        serverInfoRecorder.clientPlusOne();
-                        serverInfoRecorder.addSelectorKey(socketChannelRead);
-                    }
-                    else if(selectionKey.isReadable()){  //the client selector key
-                        serverInfoRecorder.addClientMsg(selectionKey);
-                        selectionKey.interestOps(selectionKey.interestOps() & (~SelectionKey.OP_READ));
-                        SocketChannel socketChannel = (SocketChannel)selectionKey.channel();
-                        ByteBuffer byteBuffer = (ByteBuffer)selectionKey.attachment();
+        //initiate serverSocketChannel
+        this.serverSocketChannel = ServerSocketChannel.open();
+        serverSocketChannel.configureBlocking(false);
+        serverSocketChannel.socket().bind(new InetSocketAddress(portNumber));
+        serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
+        start();
+    }
 
-                        threadPool.submit(()->{
-                            try {
-                                socketChannel.read(byteBuffer);
-                            } catch (IOException e) {
-                                System.err.println("Fail to read from channel");
-                                selectionKey.cancel();
-                                e.printStackTrace();
-                            }
-                            boolean full = false;
-                            if (!byteBuffer.hasRemaining()) {
-                                full = true;
-                                selectionKey.attach(ByteBuffer.allocate(8*1024));
-                            }
-                            selectionKey.interestOps(SelectionKey.OP_READ);
-                            selector.wakeup();
+    public void start() throws IOException,NoSuchAlgorithmException{
+        System.out.println("Server started!");
+        while(true){
+            this.selector.select();
+            Iterator<SelectionKey> keyIterator = this.selector.selectedKeys().iterator();
+            while (keyIterator.hasNext()){
+                SelectionKey selectionKey = keyIterator.next();
+                if(selectionKey.isAcceptable()){
+                    String uniqueID = UUID.randomUUID().toString();
+                    selectionKey.attach(uniqueID);
+                    ServerSocketChannel serverSocketChannel = (ServerSocketChannel)selectionKey.channel();
+                    SocketChannel socketChannel = serverSocketChannel.accept();
+                    socketChannel.configureBlocking(false);
+                    socketChannel.register(selector, SelectionKey.OP_READ);
+                    serverInfoRecorder.clientPlusOne();
+                    serverInfoRecorder.addClientMsg(selectionKey);
 
-                            if (full) {
-                                threadPool.submit(() -> {
-                                    String hashString = instance.SHA1FromBytes(byteBuffer.array());
-                                    threadPool.submit(() -> {
-                                        ByteBuffer ackBytes = ByteBuffer.allocate(hashString.length() + 1);
-                                        ackBytes.put((byte)hashString.length());
-                                        ackBytes.put(hashString.getBytes());
-                                        ackBytes.flip();
-                                        synchronized (socketChannel) {
-                                            try {
-                                                socketChannel.write(ackBytes);
-                                            } catch (IOException e) {
-                                                System.err.println(e.getMessage());
-                                            }
-                                        }
-                                        serverInfoRecorder.msgProcessedPlusOne();
-                                    });
-                                });
-                            }
-                        });
-                    }
                 }
+                else if(selectionKey.isReadable()){
+                    selectionKey.interestOps(selectionKey.interestOps()&(~SelectionKey.OP_READ));
+                    Task readTask = new ReadTask(selectionKey, this);
+                    threadPool.addTask(readTask);
+                }
+                else if(selectionKey.isWritable()){
+                    selectionKey.interestOps(selectionKey.interestOps()&(~SelectionKey.OP_WRITE));
+                    Task newTask = new WriteTask(this, selectionKey);
+                    threadPool.addTask(newTask);
+                }
+                keyIterator.remove();
+            }
+        }
+    }
+
+    public void readFunction(SelectionKey selectionKey) throws IOException, NoSuchAlgorithmException{
+        SocketChannel socketChannel = (SocketChannel) selectionKey.channel();
+        ByteBuffer byteBuffer = ByteBuffer.allocate(8*1024);
+        ;
+        try {
+            while (byteBuffer.hasRemaining()) {
+                socketChannel.read(byteBuffer);
+                byte[] data = byteBuffer.array();
+                String hash = SHA1FromBytes(data);
+                selectionKey.attach(hash);
+                serverInfoRecorder.addClientMsg(selectionKey);
             }
         }
         catch (IOException ioe){
             System.err.println(ioe.getMessage());
         }
+
+        try {
+            selectionKey.interestOps(SelectionKey.OP_WRITE);
+        }
+        catch (CancelledKeyException cke){
+            cke.printStackTrace();
+        }
+
+        selectionKey.selector().wakeup();
     }
 
+    public void writeFunction(SelectionKey selectionKey) throws IOException {
 
-    public String SHA1FromBytes(byte[] data) throws NoSuchAlgorithmException{
-        MessageDigest digest = MessageDigest.getInstance("SHA1");
+        SocketChannel socketChannel = (SocketChannel) selectionKey.channel();
+        String hash = (String)selectionKey.attachment();
+        int hashLength = hash.length();
+        String hashWithLength = String.valueOf(hashLength) + hash;
+        ByteBuffer byteBuffer = ByteBuffer.wrap(hashWithLength.getBytes());
+        serverInfoRecorder.msgProcessedPlusOne();
+        int lengthOfWrote = socketChannel.write(byteBuffer);
+
+        if(lengthOfWrote < hash.length()){
+            Task writeTask = new WriteTask(this,selectionKey);
+            threadPool.addTask(writeTask);
+            return;
+        }
+        try{
+            selectionKey.interestOps(SelectionKey.OP_READ);
+        }
+        catch (CancelledKeyException cke){
+            cke.printStackTrace();
+        }
+        selectionKey.selector().wakeup();
+    }
+
+    public String SHA1FromBytes(byte[] data) {
+        MessageDigest digest = null;
+        try{
+            digest = MessageDigest.getInstance("SHA1");
+        }
+        catch (NoSuchAlgorithmException nsae){
+            nsae.printStackTrace();;
+        }
         byte[] hash = digest.digest(data);
         BigInteger hashInt = new BigInteger(1, hash);
         return hashInt.toString(16);
     }
 
 
-
-
-
     public static void main(String[] args) {
         Server server = new Server(Integer.parseInt(args[0]), Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]));
-        server.start();
+        try{
+            server.initiate();
+        }
+        catch (IOException ioe){
+            System.err.println(ioe.getMessage());
+        }
+        catch (NoSuchAlgorithmException nsae){
+            System.err.println(nsae.getMessage());
+        }
 
     }
 

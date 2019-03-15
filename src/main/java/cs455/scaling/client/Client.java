@@ -1,13 +1,15 @@
 package cs455.scaling.client;
 
-
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.Random;
 
@@ -22,6 +24,7 @@ public class Client {
     private Thread sender;
     private Thread receiver;
     private SocketChannel socketChannel;
+    private Selector selector;
 
     public Client(String serverHost, int serverPort, int msgRate){
         this.serverHost = serverHost;
@@ -30,26 +33,57 @@ public class Client {
         msgHashs = new LinkedList<>();
         recorder = new ClientInfoRecorder();
 
-        //connect to server
-        InetSocketAddress isa = new InetSocketAddress(serverHost,serverPort);
-        try {
-            socketChannel = SocketChannel.open(isa);
+        try{
+            this.socketChannel = SocketChannel.open();
+            this.selector = Selector.open();
+            socketChannel.configureBlocking(false);
+            socketChannel.register(selector, SelectionKey.OP_CONNECT);
+            socketChannel.connect(new InetSocketAddress(this.serverHost,this.serverPort));
         }
         catch (IOException ioe){
             System.err.println(ioe.getMessage());
         }
+    }
 
+
+    /**
+     * Start all thread, sender, receiver, recorder
+     */
+    public void start() throws IOException{
+        System.out.println("Client started!");
+        recorder.start();
+        while (true) {
+            try {
+                this.selector.select();
+            }
+            catch (IOException ioe){
+                System.err.println(ioe.getMessage());
+            }
+            Iterator<SelectionKey> selectionKeyIterator = this.selector.selectedKeys().iterator();
+            while (selectionKeyIterator.hasNext()) {
+                SelectionKey selectionKey = selectionKeyIterator.next();
+                selectionKeyIterator.remove();
+                if(selectionKey.isConnectable()){
+                    this.connectFunction(selectionKey);
+                }
+                else if (selectionKey.isReadable()) {
+                    this.readFunction(selectionKey);
+                }
+            }
+        }
+    }
+
+    public void connectFunction(SelectionKey selectionKey)throws IOException{
+        SocketChannel socketChannel = (SocketChannel)selectionKey.channel();
+        socketChannel.finishConnect();
         //sender thread
         sender = new Thread(()->{
-            while (socketChannel!=null){  //connection alive
-                //get a msg
-                byte[] msg = msgGenerator();
-                //get the hash value of msg
-                String hashValue = SHA1FromBytes(msg);
-                //store hash value into LinkedList
-                msgHashs.add(hashValue);
-                //put in buffer
-                ByteBuffer buffer = ByteBuffer.wrap(msg);
+            while (true){
+
+                byte[] data = msgGenerator();
+                String hash = SHA1FromBytes(data);
+                this.msgHashs.add(hash);
+                ByteBuffer buffer = ByteBuffer.wrap(data);
                 try{
                     //write to channel
                     socketChannel.write(buffer);
@@ -57,57 +91,43 @@ public class Client {
                 catch (IOException ioe){
                     System.err.println(ioe.getMessage());
                 }
-                //sent msg plus one
-                recorder.sentPlusOne();
 
-                try{
+                selectionKey.interestOps(SelectionKey.OP_READ);
+                recorder.sentPlusOne();
+                selectionKey.selector().wakeup();
+
+                try {
                     Thread.sleep(1000/msgRate);
                 }
                 catch (InterruptedException ie){
                     System.err.println(ie.getMessage());
                 }
-            }
-        });
-
-        receiver = new Thread(()->{
-            ByteBuffer tempBuffer = ByteBuffer.allocate(8192);
-
-            while (socketChannel != null){
-                try{
-                    socketChannel.read(tempBuffer);
-                }
-                catch (IOException ioe){
-                    System.err.println(ioe.getMessage());
-                }
-                //change to read mode
-                tempBuffer.flip();
-                //read the first byte which is the string length
-                int length = tempBuffer.get();
-
-                while(tempBuffer.remaining()>=length){
-                    //create a byte array with length of hash value
-                    byte[] hashFromServer = new byte[length];
-                    //fill  in byte array
-                    tempBuffer.get(hashFromServer);
-                    //convert the byte array to String
-                    String reveivedHash = new String(hashFromServer);
-                    //find in msgHashs and remove the record, add one to the received  recorder
-                    if(msgHashs.contains(reveivedHash)){
-                        recorder.receivePlusOne();
-                        msgHashs.remove(reveivedHash);
-                    }
-                    else {
-                        System.err.println("Client get a wrong acknowledge (hash value) from Server");
-                    }
-                    //exam whether there is another hash value
-                    if(tempBuffer.hasRemaining()) {
-                        length = tempBuffer.get();
-                    }
-                }
 
             }
         });
+        sender.start();
     }
+
+    public void readFunction(SelectionKey selectionKey){
+        SocketChannel socketChannel = (SocketChannel) selectionKey.channel();
+        ByteBuffer byteBuffer = ByteBuffer.allocate(8*1024);
+
+        try {
+            socketChannel.read(byteBuffer);
+            byte[] data = byteBuffer.array();
+            String string = new String(data);
+            int len = Integer.parseInt(string.substring(0,2));
+            String hashes = string.substring(2,2+len);
+            recorder.receivePlusOne();
+            if(msgHashs.contains(hashes)){
+                msgHashs.remove(hashes);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        selectionKey.interestOps(SelectionKey.OP_WRITE);
+    }
+
 
     /**Generate a 8kb byte array randomly and return it.
      *
@@ -138,14 +158,6 @@ public class Client {
         return hashInt.toString(16);
     }
 
-    /**
-     * Start all thread, sender, receiver, recorder
-     */
-    public void start(){
-        sender.start();
-        receiver.start();
-        recorder.start();
-    }
 
 
     public static void main(String[] args) {
@@ -157,4 +169,7 @@ public class Client {
             System.err.println(e.getMessage());
         }
     }
+
+
+
 }
